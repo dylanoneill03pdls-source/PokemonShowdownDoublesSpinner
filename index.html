@@ -1177,7 +1177,7 @@ function loading(teamNumber, slotIndex, message) {
     slot.querySelector(".pokemon-actions").innerHTML = "";
 }
 
-async function renderPokemon(teamNumber, slotIndex, pokemon, note = "") {
+async function renderPokemon(teamNumber, slotIndex, pokemon, note = "", sync = true) {
     const slot = getSlot(teamNumber, slotIndex);
     const legendary = await isLegendary(pokemon.id);
 
@@ -1200,6 +1200,68 @@ async function renderPokemon(teamNumber, slotIndex, pokemon, note = "") {
     `;
 
     slot.title = note || "";
+
+    // When the host changes a Pokémon, send the exact Pokémon ID to the guest.
+    // Guests apply the received state with sync=false so the update is not echoed back.
+    if (sync && sessionRole === "host" && sessionChannel) {
+        broadcast({
+            type: "pokemon",
+            team: teamNumber,
+            slot: slotIndex,
+            pokemonId: pokemon.id,
+            note: note || ""
+        });
+    }
+}
+
+function getTeamState() {
+    const state = [];
+
+    [1, 2].forEach(teamNumber => {
+        const slots = [];
+        document.querySelectorAll("#team" + teamNumber + "Slots .pokemon-slot").forEach((slot, index) => {
+            const generation = slot.querySelector(".slot-generation");
+            const type = slot.querySelector(".slot-type");
+            slots.push({
+                slot: index,
+                pokemonId: Number(slot.dataset.pokemonId) || null,
+                generation: generation ? generation.value : "all",
+                type: type ? type.value : "all"
+            });
+        });
+        state.push({ team: teamNumber, slots });
+    });
+
+    return state;
+}
+
+async function applyTeamState(state) {
+    if (!Array.isArray(state)) return;
+
+    for (const teamState of state) {
+        const teamNumber = Number(teamState.team);
+        if (![1, 2].includes(teamNumber) || !Array.isArray(teamState.slots)) continue;
+
+        for (const item of teamState.slots) {
+            const slotIndex = Number(item.slot);
+            if (slotIndex < 0 || slotIndex > 3) continue;
+
+            const slot = getSlot(teamNumber, slotIndex);
+            const generation = slot.querySelector(".slot-generation");
+            const type = slot.querySelector(".slot-type");
+            if (generation && item.generation) generation.value = item.generation;
+            if (type && item.type) type.value = item.type;
+
+            const pokemonId = Number(item.pokemonId);
+            if (!pokemonId) continue;
+
+            try {
+                await renderPokemon(teamNumber, slotIndex, await getPokemonById(pokemonId), "", false);
+            } catch (error) {
+                console.error("Could not apply shared Pokémon state:", error);
+            }
+        }
+    }
 }
 
 async function setRandomPokemon(teamNumber, slotIndex, legendaryOnly = false) {
@@ -1468,13 +1530,34 @@ function handleSessionMessage(message) {
     if (!message || typeof message !== "object") return;
 
     if (message.type === "join" && sessionRole === "host") {
-        broadcast({ type: "hello", role: "host", sessionCode });
-        setSessionStatus('🟢 Hosting <span class="session-code">' + sessionCode + '</span> — connected! Spins from the host are shared.');
+        broadcast({
+            type: "hello",
+            role: "host",
+            sessionCode,
+            teamState: getTeamState()
+        });
+        setSessionStatus('🟢 Hosting <span class="session-code">' + sessionCode + '</span> — connected! Spins and Pokémon changes are shared.');
         return;
     }
 
     if (message.type === "hello" && sessionRole === "guest") {
-        setSessionStatus('🟢 Connected to host <span class="session-code">' + sessionCode + '</span>. Only the host spins the wheel.');
+        setSessionStatus('🟢 Connected to host <span class="session-code">' + sessionCode + '</span>. The host controls spins and Pokémon changes.');
+        if (message.teamState) {
+            applyTeamState(message.teamState);
+        }
+        return;
+    }
+
+    if (message.type === "pokemon" && sessionRole === "guest") {
+        const teamNumber = Number(message.team);
+        const slotIndex = Number(message.slot);
+        const pokemonId = Number(message.pokemonId);
+
+        if (![1, 2].includes(teamNumber) || slotIndex < 0 || slotIndex > 3 || !pokemonId) return;
+
+        getPokemonById(pokemonId)
+            .then(pokemon => renderPokemon(teamNumber, slotIndex, pokemon, message.note || "", false))
+            .catch(error => console.error("Shared Pokémon update error:", error));
         return;
     }
 
