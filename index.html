@@ -1201,15 +1201,17 @@ async function renderPokemon(teamNumber, slotIndex, pokemon, note = "", sync = t
 
     slot.title = note || "";
 
-    // When the host changes a Pokémon, send the exact Pokémon ID to the guest.
-    // Guests apply the received state with sync=false so the update is not echoed back.
-    if (sync && sessionRole === "host" && sessionChannel) {
+    // Send the complete team state after every host-side Pokémon change.
+    // This is deliberately state-based rather than event-based: if several
+    // asynchronous Pokémon operations finish close together, the guest still
+    // converges on the exact same teams.
+    if (sync && sessionRole === "host" && sessionChannel && !applyingSharedPokemonState) {
+        pokemonStateVersion += 1;
         broadcast({
-            type: "pokemon",
-            team: teamNumber,
-            slot: slotIndex,
-            pokemonId: pokemon.id,
-            note: note || ""
+            type: "pokemonState",
+            version: pokemonStateVersion,
+            teamState: getTeamState(),
+            version: pokemonStateVersion
         });
     }
 }
@@ -1401,6 +1403,8 @@ let sessionRole = "local"; // local | host | guest
 let sessionCode = "";
 let sessionChannel = null;
 let sessionStartingRotation = 0;
+let pokemonStateVersion = 0;
+let applyingSharedPokemonState = false;
 
 function setSessionStatus(message) {
     const el = document.getElementById("sessionStatus");
@@ -1534,7 +1538,8 @@ function handleSessionMessage(message) {
             type: "hello",
             role: "host",
             sessionCode,
-            teamState: getTeamState()
+            teamState: getTeamState(),
+            version: pokemonStateVersion
         });
         setSessionStatus('🟢 Hosting <span class="session-code">' + sessionCode + '</span> — connected! Spins and Pokémon changes are shared.');
         return;
@@ -1543,21 +1548,20 @@ function handleSessionMessage(message) {
     if (message.type === "hello" && sessionRole === "guest") {
         setSessionStatus('🟢 Connected to host <span class="session-code">' + sessionCode + '</span>. The host controls spins and Pokémon changes.');
         if (message.teamState) {
-            applyTeamState(message.teamState);
+            applyingSharedPokemonState = true;
+            applyTeamState(message.teamState).finally(() => { applyingSharedPokemonState = false; });
         }
         return;
     }
 
-    if (message.type === "pokemon" && sessionRole === "guest") {
-        const teamNumber = Number(message.team);
-        const slotIndex = Number(message.slot);
-        const pokemonId = Number(message.pokemonId);
-
-        if (![1, 2].includes(teamNumber) || slotIndex < 0 || slotIndex > 3 || !pokemonId) return;
-
-        getPokemonById(pokemonId)
-            .then(pokemon => renderPokemon(teamNumber, slotIndex, pokemon, message.note || "", false))
-            .catch(error => console.error("Shared Pokémon update error:", error));
+    if (message.type === "pokemonState" && sessionRole === "guest") {
+        const version = Number(message.version) || 0;
+        if (version < pokemonStateVersion) return;
+        pokemonStateVersion = version;
+        if (Array.isArray(message.teamState)) {
+            applyingSharedPokemonState = true;
+            applyTeamState(message.teamState).finally(() => { applyingSharedPokemonState = false; });
+        }
         return;
     }
 
