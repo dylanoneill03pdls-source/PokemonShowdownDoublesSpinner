@@ -138,6 +138,22 @@ canvas{filter:drop-shadow(0 6px 10px rgba(0,0,0,.45))}
 .runner.show{opacity:1;visibility:visible}
 .play{grid-area:play;background:var(--panel);border:1px solid var(--line);border-radius:6px;overflow:hidden;-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);box-shadow:0 2px 14px rgba(0,0,0,.25)}
 .play .hint{margin:10px 12px}
+
+/* ---- type-coloured Pokemon boxes ---- */
+.pokemon-slot.typed{border-left:5px solid rgb(var(--c1));background:linear-gradient(100deg,rgba(var(--c1),.46),rgba(var(--c2),.3) 75%,rgba(var(--c2),.18)),rgba(8,14,32,.38)}
+.pokemon-slot.typed .slot-number{color:rgba(255,255,255,.82)}
+.pokemon-slot.typed .pokemon-name{text-shadow:0 1px 3px rgba(0,0,0,.65)}
+.pokemon-slot.legendary{box-shadow:inset 0 0 0 2px rgba(242,183,5,.8)}
+
+/* ---- trading ---- */
+.pokemon-slot.trade-source{outline:3px solid #fff;outline-offset:-3px}
+.pokemon-actions .trade-btn.target,.pokemon-actions .trade-btn.target:hover:not(:disabled){color:#10203f;text-shadow:none;border-color:#fff;background:linear-gradient(#fff,#cfe0ff)}
+@keyframes tradeSwap{0%{transform:scale(.94);filter:brightness(1.9)}100%{transform:none;filter:none}}
+.pokemon-slot.traded{animation:tradeSwap .6s ease-out}
+@media(prefers-reduced-motion:reduce){.pokemon-slot.traded{animation:none}}
+
+/* ---- sound toggle ---- */
+.sound-toggle{font-size:12px;padding:4px 10px;margin-left:10px;vertical-align:middle}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
@@ -172,6 +188,7 @@ canvas{filter:drop-shadow(0 6px 10px rgba(0,0,0,.45))}
             <canvas id="wheel" width="1040" height="1040" role="img" aria-label="Spinning wheel"></canvas>
         </div>
         <button id="spinBtn" class="spin-button" onclick="spin()">Spin!</button>
+        <button id="soundBtn" type="button" class="sound-toggle" aria-pressed="true" onclick="toggleSound()">Sound: on</button>
         <div class="result" aria-live="polite">
             <div id="winnerName"></div>
             <img id="winnerImage" alt="Selected result">
@@ -485,6 +502,7 @@ function loading(teamNumber, slotIndex, message) {
     slot.querySelector(".types").innerHTML = "";
     slot.querySelector("img").style.display = "none";
     slot.querySelector(".pokemon-actions").innerHTML = "";
+    slot.classList.remove("typed", "trade-source");
 }
 
 async function renderPokemon(teamNumber, slotIndex, pokemon, note = "", sync = true) {
@@ -510,15 +528,22 @@ async function renderPokemon(teamNumber, slotIndex, pokemon, note = "", sync = t
         <button type="button" onclick="changeEvolution(${teamNumber},${slotIndex},-1)">Devolve</button>
         <button type="button" onclick="changeEvolution(${teamNumber},${slotIndex},1)">Evolve</button>
         <button type="button" onclick="legendaryReroll(${teamNumber},${slotIndex})">Legendary</button>
+        <button type="button" class="trade-btn" onclick="startTrade(${teamNumber},${slotIndex})">Trade</button>
     `;
 
     slot.title = note || "";
+    applyTypeStyle(slot, pokemon.types);
+    refreshTradeUI();
 
     // Send the complete team state after every host-side Pokémon change.
     // This is deliberately state-based rather than event-based: if several
     // asynchronous Pokémon operations finish close together, the guest still
     // converges on the exact same teams.
-    if (sync && sessionRole === "host" && sessionChannel && !applyingSharedPokemonState) {
+    if (sync) broadcastPokemonState();
+}
+
+function broadcastPokemonState() {
+    if (sessionRole === "host" && sessionChannel && !applyingSharedPokemonState) {
         pokemonStateVersion += 1;
         broadcast({
             type: "pokemonState",
@@ -695,6 +720,259 @@ document.addEventListener("DOMContentLoaded", () => {
     loadDefaultWheel();
 });
 
+
+
+/* =========================
+   TYPE COLOURS
+========================= */
+
+// Same palette as the .type badges above, as r,g,b so the CSS can set its own alpha.
+const TYPE_RGB = {
+    normal: "168,167,122", fire: "238,129,48", water: "99,144,240", electric: "247,208,44",
+    grass: "122,199,76", ice: "150,217,214", fighting: "194,46,40", poison: "163,62,161",
+    ground: "226,191,101", flying: "169,143,243", psychic: "249,85,135", bug: "166,185,26",
+    rock: "182,161,54", ghost: "115,87,151", dragon: "111,53,252", dark: "112,87,70",
+    steel: "183,183,206", fairy: "214,133,173"
+};
+
+function applyTypeStyle(slot, types) {
+    const list = (types || []).filter(t => TYPE_RGB[t]);
+    if (!list.length) {
+        slot.classList.remove("typed");
+        slot.style.removeProperty("--c1");
+        slot.style.removeProperty("--c2");
+        return;
+    }
+    // Dual types blend from the first type to the second; single types fade out.
+    slot.style.setProperty("--c1", TYPE_RGB[list[0]]);
+    slot.style.setProperty("--c2", TYPE_RGB[list[1] || list[0]]);
+    slot.classList.add("typed");
+}
+
+
+/* =========================
+   TRADING
+========================= */
+
+let tradeSource = null;   // { team, index } of the first Pokémon picked
+let tradeBusy = false;
+
+function titleCase(name) {
+    return String(name).replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function slotReady(slot) {
+    if (!slot || !slot.dataset.pokemonId) return false;
+    return !/^(…|Loading|No Pok)/.test(slot.querySelector(".pokemon-name").textContent.trim());
+}
+
+function startTrade(team, index) {
+    if (sessionRole === "guest") {
+        toast("The host controls Pokémon changes in a shared session.");
+        return;
+    }
+    if (!tradeSource) {
+        tradeSource = { team, index };
+        refreshTradeUI();
+        toast("Now pick the Pokémon to trade with. Esc cancels.");
+        return;
+    }
+    if (tradeSource.team === team && tradeSource.index === index) {
+        cancelTrade();
+        return;
+    }
+    const first = tradeSource;
+    tradeSource = null;
+    refreshTradeUI();
+    swapPokemon(first.team, first.index, team, index);
+}
+
+function cancelTrade() {
+    if (!tradeSource) return;
+    tradeSource = null;
+    refreshTradeUI();
+    toast("Trade cancelled.");
+}
+
+function refreshTradeUI() {
+    if (sessionRole === "guest") tradeSource = null;
+    document.querySelector(".board").classList.toggle("trading", !!tradeSource);
+
+    [1, 2].forEach(t => {
+        document.querySelectorAll("#team" + t + "Slots .pokemon-slot").forEach((slot, i) => {
+            const isSource = !!tradeSource && tradeSource.team === t && tradeSource.index === i;
+            slot.classList.toggle("trade-source", isSource);
+
+            const btn = slot.querySelector(".trade-btn");
+            if (!btn) return;
+            btn.textContent = isSource ? "Cancel trade" : (tradeSource ? "Trade here" : "Trade");
+            btn.classList.toggle("target", !!tradeSource && !isSource);
+        });
+    });
+}
+
+async function swapPokemon(team1, index1, team2, index2) {
+    if (tradeBusy) return;
+
+    const slot1 = getSlot(team1, index1);
+    const slot2 = getSlot(team2, index2);
+    if (!slotReady(slot1) || !slotReady(slot2)) {
+        toast("Wait for both Pokémon to finish loading, then try again.");
+        return;
+    }
+
+    tradeBusy = true;
+    try {
+        const [p1, p2] = await Promise.all([
+            getPokemonById(Number(slot1.dataset.pokemonId)),
+            getPokemonById(Number(slot2.dataset.pokemonId))
+        ]);
+
+        // Render both without syncing, then send one update so a guest never
+        // sees a half-finished swap.
+        await Promise.all([
+            renderPokemon(team1, index1, p2, "", false),
+            renderPokemon(team2, index2, p1, "", false)
+        ]);
+        broadcastPokemonState();
+
+        [slot1, slot2].forEach(slot => {
+            slot.classList.remove("traded");
+            void slot.offsetWidth;
+            slot.classList.add("traded");
+        });
+
+        const btn = slot2.querySelector(".trade-btn");
+        if (btn && (!document.activeElement || document.activeElement === document.body)) btn.focus();
+
+        toast("Traded " + titleCase(p1.name) + " ⇄ " + titleCase(p2.name));
+    } catch (error) {
+        console.error(error);
+        toast("Could not complete the trade. Check your connection and try again.");
+    } finally {
+        tradeBusy = false;
+    }
+}
+
+document.addEventListener("keydown", e => {
+    if (e.key === "Escape") cancelTrade();
+});
+
+
+/* =========================
+   PIANO SOUNDS
+========================= */
+
+let audioCtx = null;
+let pianoBus = null;
+let soundOn = true;
+
+function getAudio() {
+    if (!audioCtx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return null;
+        audioCtx = new AC();
+        pianoBus = audioCtx.createGain();
+        pianoBus.gain.value = 0.9;
+        const limiter = audioCtx.createDynamicsCompressor();
+        pianoBus.connect(limiter);
+        limiter.connect(audioCtx.destination);
+    }
+    if (audioCtx.state === "suspended") audioCtx.resume();
+    return audioCtx;
+}
+
+// Browsers only allow audio after a click or key press, so unlock it on the
+// first one. This also covers guests, whose spins start from the host's message.
+["pointerdown", "keydown"].forEach(type =>
+    document.addEventListener(type, () => { try { getAudio(); } catch (e) {} }, { passive: true })
+);
+
+function toggleSound() {
+    soundOn = !soundOn;
+    const btn = document.getElementById("soundBtn");
+    btn.textContent = soundOn ? "Sound: on" : "Sound: off";
+    btn.setAttribute("aria-pressed", String(soundOn));
+    if (soundOn) getAudio();
+}
+
+// A simple piano voice: a few harmonics, a soft hammer attack and a decay
+// that darkens as the note fades.
+function playPianoNote(freq, volume = 0.16, duration = 0.8, delay = 0) {
+    if (!soundOn) return;
+    try {
+        const ac = getAudio();
+        if (!ac) return;
+        const t = ac.currentTime + delay;
+
+        const out = ac.createGain();
+        out.gain.setValueAtTime(0.0001, t);
+        out.gain.exponentialRampToValueAtTime(volume, t + 0.006);
+        out.gain.exponentialRampToValueAtTime(0.0001, t + duration);
+
+        const tone = ac.createBiquadFilter();
+        tone.type = "lowpass";
+        tone.frequency.setValueAtTime(Math.min(freq * 8, 9000), t);
+        tone.frequency.exponentialRampToValueAtTime(Math.max(freq * 2, 500), t + duration);
+
+        out.connect(tone);
+        tone.connect(pianoBus);
+
+        [[1, 1, "triangle"], [2, 0.45, "sine"], [3, 0.2, "sine"], [4, 0.1, "sine"]].forEach(([mult, amp, wave]) => {
+            const osc = ac.createOscillator();
+            const g = ac.createGain();
+            osc.type = wave;
+            osc.frequency.value = freq * mult;
+            g.gain.value = amp;
+            osc.connect(g);
+            g.connect(out);
+            osc.start(t);
+            osc.stop(t + duration + 0.05);
+        });
+    } catch (error) {
+        // Sound is optional.
+    }
+}
+
+// C major pentatonic across two octaves (plus the top C), so any run of keys sounds good.
+const SPIN_SCALE = [0, 2, 4, 7, 9, 12, 14, 16, 19, 21, 24].map(n => 261.63 * Math.pow(2, n / 12));
+let tickStep = 0;
+let lastTickSlice = -1;
+let lastTickAt = 0;
+
+// Which slice is under the pointer (top of the wheel) right now.
+function sliceUnderPointer() {
+    const total = getTotalWeight();
+    if (total <= 0 || !options.length) return -1;
+
+    const full = Math.PI * 2;
+    let angle = (-Math.PI / 2 - rotation) % full;
+    if (angle < 0) angle += full;
+
+    let acc = 0;
+    for (let i = 0; i < options.length; i++) {
+        acc += getWeight(options[i]) / total * full;
+        if (angle < acc) return i;
+    }
+    return options.length - 1;
+}
+
+// Play the next piano key each time the pointer crosses into a new slice.
+// The keys walk up the scale and back down again; they spread out
+// naturally as the wheel slows down.
+function pianoTick() {
+    const index = sliceUnderPointer();
+    if (index < 0 || index === lastTickSlice) return;
+    lastTickSlice = index;
+
+    const now = performance.now();
+    if (now - lastTickAt < 45) return;   // very fast spins: don't pile up notes
+    lastTickAt = now;
+
+    const last = SPIN_SCALE.length - 1;
+    const step = tickStep++ % (last * 2);
+    playPianoNote(SPIN_SCALE[step <= last ? step : last * 2 - step]);
+}
 
 
 const canvas = document.getElementById("wheel");
@@ -1302,6 +1580,10 @@ function runSpinAnimation(winner, extraSpins = 7, duration = 5000) {
     document.getElementById("spinBtn").disabled = true;
     document.getElementById("runner").classList.add("show");
 
+    getAudio();
+    lastTickSlice = sliceUnderPointer();
+    tickStep = 0;
+
     document.getElementById(
         "winnerName"
     ).textContent =
@@ -1379,6 +1661,8 @@ function runSpinAnimation(winner, extraSpins = 7, duration = 5000) {
 
         drawWheel();
 
+
+        pianoTick();
 
         if (progress < 1) {
 
@@ -1505,49 +1789,10 @@ function createConfetti() {
 
 function playSound() {
 
-    try {
-
-        const AudioContext =
-            window.AudioContext ||
-            window.webkitAudioContext;
-
-        const audio =
-            new AudioContext();
-
-        const oscillator =
-            audio.createOscillator();
-
-        const gain =
-            audio.createGain();
-
-        oscillator.connect(gain);
-        gain.connect(audio.destination);
-
-        oscillator.frequency.value =
-            500;
-
-        oscillator.type =
-            "sine";
-
-        gain.gain.setValueAtTime(
-            0.15,
-            audio.currentTime
-        );
-
-        gain.gain.exponentialRampToValueAtTime(
-            0.001,
-            audio.currentTime + 0.5
-        );
-
-        oscillator.start();
-
-        oscillator.stop(
-            audio.currentTime + 0.5
-        );
-
-    } catch (error) {
-        // Sound is optional.
-    }
+    // Finishing flourish: a rising C major arpeggio.
+    [261.63, 523.25, 659.25, 783.99, 1046.5].forEach((freq, i) => {
+        playPianoNote(freq, 0.15, 1.8, i * 0.09);
+    });
 }
 
 
